@@ -6,6 +6,7 @@ const PROVIDERS = [
   { id: 'openai', name: 'OpenAI', defaultModel: 'gpt-4o-mini', keyHint: 'sk-...' },
   { id: 'anthropic', name: 'Anthropic Claude', defaultModel: 'claude-sonnet-4-20250514', keyHint: 'sk-ant-...' },
   { id: 'groq', name: 'Groq', defaultModel: 'llama-3.3-70b-versatile', keyHint: 'gsk_...' },
+  { id: 'openrouter', name: 'OpenRouter', defaultModel: 'openai/gpt-4o-mini', keyHint: 'sk-or-...' },
 ] as const;
 
 interface LLMSettingsProps {

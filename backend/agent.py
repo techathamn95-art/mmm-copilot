@@ -163,6 +163,15 @@ class MMMAgentService:
             _os.environ["GROQ_API_KEY"] = api_key
             return GroqModel(model_name or "llama-3.3-70b-versatile")
 
+        if provider == "openrouter" and OpenAIModel is not None:
+            import os as _os
+            _os.environ["OPENROUTER_API_KEY"] = api_key
+            return OpenAIModel(
+                model_name or "openai/gpt-4o-mini",
+                base_url="https://openrouter.ai/api/v1",
+                api_key=api_key,
+            )
+
         # Fallback to Google if available
         if GoogleModel is not None:
             return GoogleModel(model_name or "gemini-2.0-flash")
