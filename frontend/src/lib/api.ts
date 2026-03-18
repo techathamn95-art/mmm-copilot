@@ -27,6 +27,32 @@ export async function loadDemo(): Promise<UploadResponse> {
   return response.json();
 }
 
+export async function getLLMConfig(): Promise<{ configured: boolean; provider: string | null; model: string | null }> {
+  const response = await fetch(`${API_BASE}/llm-config`);
+  if (!response.ok) throw new Error(await response.text());
+  return response.json();
+}
+
+export async function setLLMConfig(provider: string, apiKey: string, model: string): Promise<void> {
+  const response = await fetch(`${API_BASE}/llm-config`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider, api_key: apiKey, model }),
+  });
+  if (!response.ok) throw new Error(await response.text());
+}
+
+export async function testLLM(provider: string, apiKey: string, model: string): Promise<{ ok: boolean; message: string }> {
+  const response = await fetch(`${API_BASE}/llm-test`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider, api_key: apiKey, model }),
+  });
+  const data = await response.json();
+  if (data.status === 'error') return { ok: false, message: data.detail };
+  return { ok: true, message: data.response };
+}
+
 export async function streamChat(
   sessionId: string,
   message: string,

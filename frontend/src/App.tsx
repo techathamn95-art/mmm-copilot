@@ -2,7 +2,8 @@ import React, { useState } from 'react';
 import { ChatPanel } from './components/ChatPanel';
 import { DataSidebar } from './components/DataSidebar';
 import { UploadPanel } from './components/UploadPanel';
-import { streamChat, uploadCsv, loadDemo } from './lib/api';
+import { LLMSettings } from './components/LLMSettings';
+import { streamChat, uploadCsv, loadDemo, getLLMConfig, setLLMConfig, testLLM } from './lib/api';
 import { ColumnMapping, Message, SummaryStats } from './lib/types';
 
 function makeMessage(role: Message['role'], content: string, toolResults = []): Message {
@@ -26,6 +27,18 @@ export default function App() {
     'Optimize my budget for $100K/month',
     'What if I double TikTok spend?',
   ]);
+  const [llmConfigured, setLlmConfigured] = useState(false);
+  const [llmProvider, setLlmProvider] = useState<string | null>(null);
+  const [llmModel, setLlmModel] = useState<string | null>(null);
+
+  // Check LLM config on mount
+  React.useEffect(() => {
+    getLLMConfig().then(c => {
+      setLlmConfigured(c.configured);
+      setLlmProvider(c.provider);
+      setLlmModel(c.model);
+    }).catch(() => {});
+  }, []);
 
   // Auto-load demo data on mount
   React.useEffect(() => {
@@ -106,6 +119,20 @@ export default function App() {
           </div>
         </div>
         <UploadPanel isUploading={isUploading} onUpload={handleUpload} />
+        <LLMSettings
+          configured={llmConfigured}
+          provider={llmProvider}
+          model={llmModel}
+          onConfigure={async (provider, apiKey, model) => {
+            await setLLMConfig(provider, apiKey, model);
+            setLlmConfigured(true);
+            setLlmProvider(provider);
+            setLlmModel(model);
+          }}
+          onTest={async (provider, apiKey, model) => {
+            return testLLM(provider, apiKey, model);
+          }}
+        />
         <DataSidebar summary={summary} />
       </aside>
       <main className="main-panel">

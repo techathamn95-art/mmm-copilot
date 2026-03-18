@@ -16,6 +16,22 @@ except Exception:  # pragma: no cover
     RunContext = Any
     GoogleModel = None
 
+# Try to import other model providers
+try:
+    from pydantic_ai.models.openai import OpenAIModel
+except Exception:
+    OpenAIModel = None
+
+try:
+    from pydantic_ai.models.anthropic import AnthropicModel
+except Exception:
+    AnthropicModel = None
+
+try:
+    from pydantic_ai.models.groq import GroqModel
+except Exception:
+    GroqModel = None
+
 
 @dataclass
 class AgentDeps:
@@ -34,15 +50,26 @@ When tools return charts or tables, summarize the key takeaway and keep the resu
 
 
 class MMMAgentService:
-    def __init__(self, engine: Any) -> None:
+    def __init__(self, engine: Any, llm_config: dict | None = None) -> None:
         self.engine = engine
+        self.llm_config = llm_config or {}
         self.agent = self._build_agent()
 
     def _build_agent(self) -> Agent | None:
-        if Agent is None or GoogleModel is None or not os.getenv("GOOGLE_API_KEY"):
+        if Agent is None:
             return None
 
-        model = GoogleModel("gemini-2.0-flash")
+        provider = self.llm_config.get("provider")
+        api_key = self.llm_config.get("api_key") or os.getenv("GOOGLE_API_KEY")
+        model_name = self.llm_config.get("model")
+
+        if not api_key:
+            return None
+
+        model = self._create_model(provider, api_key, model_name)
+        if model is None:
+            return None
+
         agent = Agent(
             model=model,
             deps_type=AgentDeps,
@@ -111,6 +138,36 @@ class MMMAgentService:
             return ctx.deps.engine.channel_deep_dive(ctx.deps.session_id, channel).model_dump()
 
         return agent
+
+    def _create_model(self, provider: str | None, api_key: str, model_name: str | None) -> Any:
+        """Create a Pydantic AI model instance from provider config."""
+        provider = (provider or "google").lower()
+
+        if provider == "google" and GoogleModel is not None:
+            import os as _os
+            _os.environ["GOOGLE_API_KEY"] = api_key
+            return GoogleModel(model_name or "gemini-2.0-flash")
+
+        if provider == "openai" and OpenAIModel is not None:
+            import os as _os
+            _os.environ["OPENAI_API_KEY"] = api_key
+            return OpenAIModel(model_name or "gpt-4o-mini")
+
+        if provider == "anthropic" and AnthropicModel is not None:
+            import os as _os
+            _os.environ["ANTHROPIC_API_KEY"] = api_key
+            return AnthropicModel(model_name or "claude-sonnet-4-20250514")
+
+        if provider == "groq" and GroqModel is not None:
+            import os as _os
+            _os.environ["GROQ_API_KEY"] = api_key
+            return GroqModel(model_name or "llama-3.3-70b-versatile")
+
+        # Fallback to Google if available
+        if GoogleModel is not None:
+            return GoogleModel(model_name or "gemini-2.0-flash")
+
+        return None
 
     async def run(self, session_id: str, message: str) -> AgentResponse:
         if self.agent is None:

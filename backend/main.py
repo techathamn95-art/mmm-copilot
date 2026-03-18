@@ -10,6 +10,7 @@ from typing import AsyncGenerator
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
 
 from agent import MMMAgentService, serialize_sse
 from mmm_engine import MMMEngine
@@ -23,6 +24,21 @@ from schemas import (
 
 SAMPLE_SESSION_ID = "demo"
 
+_llm_config: dict = {"provider": None, "api_key": None, "model": None}
+
+
+class LLMConfigRequest(BaseModel):
+    provider: str  # google, openai, anthropic, groq
+    api_key: str
+    model: str | None = None
+
+
+class LLMTestRequest(BaseModel):
+    provider: str
+    api_key: str
+    model: str | None = None
+
+
 app = FastAPI(title="MMM AI App", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
@@ -35,6 +51,39 @@ app.add_middleware(
 engine = MMMEngine()
 agent_service = MMMAgentService(engine)
 chat_history: dict[str, list[HistoryMessage]] = {}
+
+
+# ── LLM Config ──────────────────────────────────────────────
+@app.get("/api/llm-config")
+async def get_llm_config() -> JSONResponse:
+    return JSONResponse({
+        "configured": _llm_config["provider"] is not None,
+        "provider": _llm_config["provider"],
+        "model": _llm_config["model"],
+    })
+
+
+@app.post("/api/llm-config")
+async def set_llm_config(request: LLMConfigRequest) -> JSONResponse:
+    global agent_service, _llm_config
+    _llm_config = {"provider": request.provider, "api_key": request.api_key, "model": request.model}
+    agent_service = MMMAgentService(engine, llm_config=_llm_config)
+    return JSONResponse({"status": "ok", "provider": request.provider, "model": request.model})
+
+
+@app.post("/api/llm-test")
+async def test_llm(request: LLMTestRequest) -> JSONResponse:
+    """Test the LLM connection with a simple prompt."""
+    try:
+        test_service = MMMAgentService(engine, llm_config={
+            "provider": request.provider,
+            "api_key": request.api_key,
+            "model": request.model,
+        })
+        result = await test_service.run(SAMPLE_SESSION_ID, "Say hello in one sentence.")
+        return JSONResponse({"status": "ok", "response": result.text[:200]})
+    except Exception as exc:
+        return JSONResponse(status_code=400, content={"status": "error", "detail": str(exc)})
 
 
 def append_message(session_id: str, role: str, content: str, tool_results: list | None = None) -> None:
