@@ -1,8 +1,8 @@
-import { useState } from 'react';
+import React, { useState } from 'react';
 import { ChatPanel } from './components/ChatPanel';
 import { DataSidebar } from './components/DataSidebar';
 import { UploadPanel } from './components/UploadPanel';
-import { streamChat, uploadCsv } from './lib/api';
+import { streamChat, uploadCsv, loadDemo } from './lib/api';
 import { ColumnMapping, Message, SummaryStats } from './lib/types';
 
 function makeMessage(role: Message['role'], content: string, toolResults = []): Message {
@@ -18,12 +18,7 @@ function makeMessage(role: Message['role'], content: string, toolResults = []): 
 export default function App() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [summary, setSummary] = useState<SummaryStats | null>(null);
-  const [messages, setMessages] = useState<Message[]>([
-    makeMessage(
-      'assistant',
-      'Upload a CSV and I will fit a baseline marketing mix model, estimate ROAS by channel, and explore budget scenarios.',
-    ),
-  ]);
+  const [messages, setMessages] = useState<Message[]>([]);
   const [isUploading, setIsUploading] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
   const [suggestions, setSuggestions] = useState<string[]>([
@@ -31,6 +26,28 @@ export default function App() {
     'Optimize my budget for $100K/month',
     'What if I double TikTok spend?',
   ]);
+
+  // Auto-load demo data on mount
+  React.useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const payload = await loadDemo();
+        if (cancelled) return;
+        setSessionId(payload.session_id);
+        setSummary(payload.summary);
+        setMessages([
+          makeMessage(
+            'system',
+            `Demo loaded — ${payload.summary.rows.toLocaleString()} rows across ${payload.summary.channels} channels (${payload.summary.date_range.start} to ${payload.summary.date_range.end}). Try a suggestion below!`,
+          ),
+        ]);
+      } catch {
+        // Demo not available — user can upload manually
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   async function handleUpload(file: File, mapping: ColumnMapping) {
     setIsUploading(true);

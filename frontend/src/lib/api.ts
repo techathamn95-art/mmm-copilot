@@ -19,6 +19,14 @@ export async function uploadCsv(file: File, mapping: ColumnMapping): Promise<Upl
   return response.json();
 }
 
+export async function loadDemo(): Promise<UploadResponse> {
+  const response = await fetch(`${API_BASE}/demo`);
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+  return response.json();
+}
+
 export async function streamChat(
   sessionId: string,
   message: string,

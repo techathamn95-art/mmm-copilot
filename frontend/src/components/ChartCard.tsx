@@ -48,12 +48,12 @@ export function ChartCard({ chart }: ChartCardProps) {
             {chart.type === 'bar' && (
               <BarChart data={data} layout="vertical" margin={{ left: 18, right: 12 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="rgba(148, 163, 184, 0.15)" />
-                <XAxis type="number" stroke="#94a3b8" />
-                <YAxis dataKey="label" type="category" stroke="#cbd5e1" width={84} />
+                <XAxis type="number" stroke="rgba(235,235,245,0.3)" />
+                <YAxis dataKey="label" type="category" stroke="rgba(235,235,245,0.45)" width={84} />
                 <Tooltip />
                 <Bar dataKey="value" radius={[0, 8, 8, 0]}>
                   {data.map((entry, index) => (
-                    <Cell key={`${entry.label}-${index}`} fill={entry.color || '#60a5fa'} />
+                    <Cell key={`${entry.label}-${index}`} fill={entry.color || '#0a84ff'} />
                   ))}
                 </Bar>
               </BarChart>
@@ -64,7 +64,7 @@ export function ChartCard({ chart }: ChartCardProps) {
                 <Legend />
                 <Pie data={data} dataKey="value" nameKey="label" innerRadius={52} outerRadius={96}>
                   {data.map((entry, index) => (
-                    <Cell key={`${entry.label}-${index}`} fill={entry.color || '#60a5fa'} />
+                    <Cell key={`${entry.label}-${index}`} fill={entry.color || '#0a84ff'} />
                   ))}
                 </Pie>
               </PieChart>
@@ -72,17 +72,17 @@ export function ChartCard({ chart }: ChartCardProps) {
             {chart.type === 'scatter' && (
               <ScatterChart margin={{ top: 12, right: 12, bottom: 12, left: 12 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="rgba(148, 163, 184, 0.15)" />
-                <XAxis type="number" dataKey="spend" stroke="#94a3b8" />
-                <YAxis type="number" dataKey="revenue" stroke="#94a3b8" />
+                <XAxis type="number" dataKey="spend" stroke="rgba(235,235,245,0.3)" />
+                <YAxis type="number" dataKey="revenue" stroke="rgba(235,235,245,0.3)" />
                 <Tooltip cursor={{ strokeDasharray: '3 3' }} />
-                <Scatter data={data} fill="#38bdf8" />
+                <Scatter data={data} fill="#0a84ff" />
               </ScatterChart>
             )}
             {chart.type === 'line' && (
               <LineChart data={data}>
                 <CartesianGrid strokeDasharray="3 3" stroke="rgba(148, 163, 184, 0.15)" />
-                <XAxis dataKey="label" stroke="#94a3b8" />
-                <YAxis stroke="#94a3b8" />
+                <XAxis dataKey="label" stroke="rgba(235,235,245,0.3)" />
+                <YAxis stroke="rgba(235,235,245,0.3)" />
                 <Tooltip />
                 <Legend />
                 {chart.series.map((series) => (
@@ -90,7 +90,7 @@ export function ChartCard({ chart }: ChartCardProps) {
                     key={series.key}
                     type="monotone"
                     dataKey={series.key}
-                    stroke={series.color || '#60a5fa'}
+                    stroke={series.color || '#0a84ff'}
                     strokeWidth={3}
                     dot={{ r: 4 }}
                   />
@@ -100,12 +100,12 @@ export function ChartCard({ chart }: ChartCardProps) {
             {chart.type === 'stacked_bar' && (
               <BarChart data={data}>
                 <CartesianGrid strokeDasharray="3 3" stroke="rgba(148, 163, 184, 0.15)" />
-                <XAxis dataKey="label" stroke="#94a3b8" />
-                <YAxis stroke="#94a3b8" />
+                <XAxis dataKey="label" stroke="rgba(235,235,245,0.3)" />
+                <YAxis stroke="rgba(235,235,245,0.3)" />
                 <Tooltip />
                 <Legend />
                 {chart.series.map((series) => (
-                  <Bar key={series.key} dataKey={series.key} stackId="budget" fill={series.color || '#60a5fa'} radius={6} />
+                  <Bar key={series.key} dataKey={series.key} stackId="budget" fill={series.color || '#0a84ff'} radius={6} />
                 ))}
               </BarChart>
             )}

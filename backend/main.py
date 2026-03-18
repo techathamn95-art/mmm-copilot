@@ -4,6 +4,7 @@ import asyncio
 import json
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import AsyncGenerator
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -20,6 +21,7 @@ from schemas import (
     UploadResponse,
 )
 
+SAMPLE_SESSION_ID = "demo"
 
 app = FastAPI(title="MMM AI App", version="1.0.0")
 app.add_middleware(
@@ -48,9 +50,34 @@ def append_message(session_id: str, role: str, content: str, tool_results: list 
     )
 
 
+# Auto-load sample data on startup
+_sample_csv = Path(__file__).parent.parent / "sample_data.csv"
+if _sample_csv.exists():
+    engine.parse_csv(SAMPLE_SESSION_ID, _sample_csv.read_bytes(), "sample_data.csv", ColumnMapping())
+    append_message(SAMPLE_SESSION_ID, "system", "Demo dataset loaded (6 months, 4 channels, 724 rows).")
+
+
 @app.get("/api/health")
 async def health() -> JSONResponse:
     return JSONResponse({"status": "ok"})
+
+
+@app.get("/api/demo", response_model=UploadResponse)
+async def demo_session() -> UploadResponse:
+    """Return the pre-loaded sample dataset so the frontend can start immediately."""
+    try:
+        summary = engine.get_summary(SAMPLE_SESSION_ID)
+        preview = engine.get_preview(SAMPLE_SESSION_ID)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Demo data not loaded") from exc
+    return UploadResponse(
+        session_id=SAMPLE_SESSION_ID,
+        file_name="sample_data.csv",
+        columns=["date", "channel", "spend", "revenue"],
+        mapping=ColumnMapping(),
+        summary=summary,
+        preview=preview,
+    )
 
 
 @app.post("/api/upload", response_model=UploadResponse)
