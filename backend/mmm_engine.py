@@ -5,6 +5,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from scipy.optimize import minimize
 from sklearn.linear_model import Ridge
 
 from schemas import ChartDataPoint, ChartPayload, ChartSeries, ColumnMapping, ToolResult
@@ -17,6 +18,49 @@ CHANNEL_COLORS = {
     "TV": "#eab308",
 }
 
+DEFAULT_ADSTOCK_DECAY = 0.5
+DEFAULT_HILL_SLOPE = 2.0
+BOOTSTRAP_SAMPLES = 200
+DAYS_PER_MONTH = 30.4375
+WEEKS_PER_MONTH = DAYS_PER_MONTH / 7.0
+
+
+def adstock_transform(spend_series: np.ndarray, decay_rate: float = DEFAULT_ADSTOCK_DECAY) -> np.ndarray:
+    """Geometric adstock carryover applied on a daily spend series."""
+    spend = np.asarray(spend_series, dtype=float)
+    if spend.size == 0:
+        return spend.copy()
+    adstock = np.zeros_like(spend, dtype=float)
+    adstock[0] = spend[0]
+    for idx in range(1, len(spend)):
+        adstock[idx] = spend[idx] + decay_rate * adstock[idx - 1]
+    return adstock
+
+
+def hill_saturation(
+    adstock: np.ndarray,
+    half_saturation: float,
+    slope: float = DEFAULT_HILL_SLOPE,
+) -> np.ndarray:
+    """Hill saturation curve with diminishing returns."""
+    x = np.maximum(np.asarray(adstock, dtype=float), 0.0)
+    half = max(float(half_saturation), 1e-6)
+    exp = max(float(slope), 1e-6)
+    numerator = np.power(x, exp)
+    denominator = numerator + np.power(half, exp)
+    return np.divide(numerator, np.maximum(denominator, 1e-12))
+
+
+def hill_derivative(adstock: np.ndarray, half_saturation: float, slope: float = DEFAULT_HILL_SLOPE) -> np.ndarray:
+    """Derivative of the Hill curve with respect to adstock."""
+    x = np.maximum(np.asarray(adstock, dtype=float), 1e-12)
+    half = max(float(half_saturation), 1e-6)
+    exp = max(float(slope), 1e-6)
+    half_term = np.power(half, exp)
+    numerator = exp * np.power(x, exp - 1.0) * half_term
+    denominator = np.power(np.power(x, exp) + half_term, 2.0)
+    return np.divide(numerator, np.maximum(denominator, 1e-12))
+
 
 @dataclass
 class MMMArtifacts:
@@ -26,8 +70,24 @@ class MMMArtifacts:
     intercept: float
     roas: dict[str, float]
     contributions: dict[str, float]
-    monthly_summary: list[dict[str, Any]]
+    weekly_summary: list[dict[str, Any]]
     r2: float
+    weekly_features: pd.DataFrame
+    weekly_target: pd.Series
+    weekly_predictions: np.ndarray
+    daily_spend: pd.DataFrame
+    daily_adstock: pd.DataFrame
+    daily_saturation: pd.DataFrame
+    weekly_spend: pd.DataFrame
+    weekly_contribution: pd.DataFrame
+    spend_by_channel: dict[str, float]
+    channel_params: dict[str, dict[str, float]]
+    bootstrap_intercepts: np.ndarray
+    bootstrap_coefficients: np.ndarray
+    bootstrap_roas: dict[str, np.ndarray]
+    bootstrap_contributions: dict[str, np.ndarray]
+    bootstrap_predictions: np.ndarray
+    current_monthly_allocation: dict[str, float]
 
 
 class MMMEngine:
@@ -55,6 +115,7 @@ class MMMEngine:
 
         self.dataframes[session_id] = normalized
         self.mappings[session_id] = chosen_mapping
+        self.models.pop(session_id, None)
 
         return {
             "file_name": file_name,
@@ -100,92 +161,127 @@ class MMMEngine:
 
     def fit_model(self, session_id: str) -> ToolResult:
         df = self.get_dataframe(session_id)
-        feature_frame = (
-            df.assign(month=df["date"].dt.to_period("M").astype(str))
-            .pivot_table(index="month", columns="channel", values="spend", aggfunc="sum", fill_value=0.0)
-            .sort_index()
-        )
-        revenue_target = (
-            df.assign(month=df["date"].dt.to_period("M").astype(str))
-            .groupby("month")["revenue"]
-            .sum()
-            .reindex(feature_frame.index)
-        )
+        prepared = self._prepare_model_inputs(df)
 
         model = Ridge(alpha=1.0)
-        model.fit(feature_frame, revenue_target)
-        predictions = model.predict(feature_frame)
-        r2 = float(model.score(feature_frame, revenue_target))
-        coefficients = {col: float(coef) for col, coef in zip(feature_frame.columns.tolist(), model.coef_)}
-        raw_contributions = {
-            channel: float(feature_frame[channel].sum() * coefficients.get(channel, 0.0))
-            for channel in feature_frame.columns
-        }
-        total_contribution = sum(max(value, 0.0) for value in raw_contributions.values()) or 1.0
-        contributions = {
-            channel: max(value, 0.0) / total_contribution for channel, value in raw_contributions.items()
-        }
+        model.fit(prepared["weekly_features"], prepared["weekly_target"])
+        predictions = model.predict(prepared["weekly_features"])
+        r2 = float(model.score(prepared["weekly_features"], prepared["weekly_target"]))
 
+        feature_columns = prepared["weekly_features"].columns.tolist()
+        coefficients = {col: float(coef) for col, coef in zip(feature_columns, model.coef_)}
+        raw_contributions = {
+            channel: float(prepared["weekly_features"][channel].sum() * coefficients.get(channel, 0.0))
+            for channel in feature_columns
+        }
+        positive_total = sum(max(value, 0.0) for value in raw_contributions.values()) or 1.0
+        contributions = {
+            channel: max(value, 0.0) / positive_total
+            for channel, value in raw_contributions.items()
+        }
         spend_by_channel = df.groupby("channel")["spend"].sum().to_dict()
         roas = {
             channel: round(
-                (max(raw_contributions.get(channel, 0.0), 0.0) + 1e-6) / max(spend_by_channel.get(channel, 1.0), 1.0),
+                max(raw_contributions.get(channel, 0.0), 0.0) / max(spend_by_channel.get(channel, 1.0), 1.0),
                 4,
             )
-            for channel in spend_by_channel
+            for channel in feature_columns
         }
-        monthly_summary = []
-        for month, actual, predicted in zip(feature_frame.index.tolist(), revenue_target.tolist(), predictions.tolist()):
-            monthly_summary.append(
-                {
-                    "month": month,
-                    "actual_revenue": round(float(actual), 2),
-                    "predicted_revenue": round(float(predicted), 2),
-                }
-            )
+
+        bootstrap = self._bootstrap_model(
+            weekly_features=prepared["weekly_features"],
+            weekly_target=prepared["weekly_target"],
+            fitted=predictions,
+            residuals=prepared["weekly_target"].to_numpy(dtype=float) - predictions,
+            feature_columns=feature_columns,
+            spend_by_channel=spend_by_channel,
+        )
+
+        weekly_summary = self._build_weekly_summary(
+            weekly_index=prepared["weekly_features"].index,
+            actual=prepared["weekly_target"].to_numpy(dtype=float),
+            predicted=predictions,
+            bootstrap_predictions=bootstrap["predictions"],
+        )
+
+        weekly_contribution = pd.DataFrame(
+            {
+                channel: prepared["weekly_features"][channel] * coefficients.get(channel, 0.0)
+                for channel in feature_columns
+            },
+            index=prepared["weekly_features"].index,
+        )
+        current_monthly_allocation = self._current_monthly_allocation(session_id, feature_columns)
 
         self.models[session_id] = MMMArtifacts(
             model=model,
-            feature_columns=feature_frame.columns.tolist(),
+            feature_columns=feature_columns,
             coefficients=coefficients,
             intercept=float(model.intercept_),
             roas=roas,
             contributions=contributions,
-            monthly_summary=monthly_summary,
+            weekly_summary=weekly_summary,
             r2=r2,
+            weekly_features=prepared["weekly_features"],
+            weekly_target=prepared["weekly_target"],
+            weekly_predictions=predictions,
+            daily_spend=prepared["daily_spend"],
+            daily_adstock=prepared["daily_adstock"],
+            daily_saturation=prepared["daily_saturation"],
+            weekly_spend=prepared["weekly_spend"],
+            weekly_contribution=weekly_contribution,
+            spend_by_channel=spend_by_channel,
+            channel_params=prepared["channel_params"],
+            bootstrap_intercepts=bootstrap["intercepts"],
+            bootstrap_coefficients=bootstrap["coefficients"],
+            bootstrap_roas=bootstrap["roas"],
+            bootstrap_contributions=bootstrap["contributions"],
+            bootstrap_predictions=bootstrap["predictions"],
+            current_monthly_allocation=current_monthly_allocation,
         )
 
         return ToolResult(
             tool="fit_model",
             title="Marketing mix model fitted",
-            summary="A ridge-regression baseline was trained on monthly spend by channel to estimate channel contribution and efficiency.",
+            summary="A ridge MMM was trained on weekly outcomes using daily adstock and Hill saturation transforms, with bootstrap intervals for fitted revenue.",
             metrics={
                 "r2": round(r2, 4),
-                "months_modeled": len(feature_frame.index),
-                "predicted_revenue": round(float(sum(item["predicted_revenue"] for item in monthly_summary)), 2),
+                "weeks_modeled": len(prepared["weekly_features"].index),
+                "predicted_revenue": round(float(np.sum(predictions)), 2),
+                "bootstrap_samples": BOOTSTRAP_SAMPLES,
             },
-            tables={"monthly_performance": monthly_summary},
+            tables={
+                "weekly_performance": weekly_summary,
+                "channel_parameters": self._channel_parameter_rows(prepared["channel_params"]),
+            },
             charts=[
-                self._build_roas_chart(roas),
-                self._build_contribution_chart(contributions, df),
+                self._build_roas_chart(roas, bootstrap["roas"]),
+                self._build_contribution_chart(contributions, bootstrap["contributions"], df),
                 self._build_efficiency_scatter(df, roas),
+                self._build_weekly_fit_chart(weekly_summary),
             ],
         )
 
     def get_roas(self, session_id: str) -> ToolResult:
         artifacts = self._ensure_model(session_id)
+        rows = []
+        for channel, value in sorted(artifacts.roas.items(), key=lambda item: item[1], reverse=True):
+            lower, upper = self._percentile_interval(artifacts.bootstrap_roas[channel])
+            rows.append(
+                {
+                    "channel": channel,
+                    "roas": round(value, 4),
+                    "lower_bound": round(lower, 4),
+                    "upper_bound": round(upper, 4),
+                }
+            )
         return ToolResult(
             tool="get_roas",
             title="Channel ROAS",
-            summary="ROAS is estimated from modeled revenue contribution divided by spend for each channel.",
+            summary="ROAS reflects modeled channel contribution after adstock and saturation, with bootstrap 5th and 95th percentile intervals.",
             metrics={"best_roas": round(max(artifacts.roas.values()), 4)},
-            tables={
-                "roas": [
-                    {"channel": channel, "roas": round(value, 4)}
-                    for channel, value in sorted(artifacts.roas.items(), key=lambda item: item[1], reverse=True)
-                ]
-            },
-            charts=[self._build_roas_chart(artifacts.roas)],
+            tables={"roas": rows},
+            charts=[self._build_roas_chart(artifacts.roas, artifacts.bootstrap_roas)],
         )
 
     def optimize_budget(
@@ -196,52 +292,86 @@ class MMMEngine:
         max_share: float = 0.5,
     ) -> ToolResult:
         artifacts = self._ensure_model(session_id)
-        channels = list(artifacts.roas.keys())
-        weights = np.array([max(artifacts.roas[channel], 0.05) for channel in channels], dtype=float)
-        weights = weights / weights.sum()
+        channels = artifacts.feature_columns
 
-        min_amount = monthly_budget * min_share
-        max_amount = monthly_budget * max_share
-        proposed = {}
-        remaining_budget = monthly_budget
-        remaining_weights = weights.copy()
+        lower_share = max(min_share, 0.0)
+        upper_share = max(max_share, 0.0)
+        if lower_share * len(channels) > 1.0:
+            lower_share = 0.0
+        if upper_share * len(channels) < 1.0:
+            upper_share = 1.0
 
-        for idx, channel in enumerate(channels):
-            allocation = monthly_budget * weights[idx]
-            bounded = min(max(allocation, min_amount), max_amount)
-            proposed[channel] = bounded
-            remaining_budget -= bounded
-            remaining_weights[idx] = 0.0
-
-        if abs(remaining_budget) > 1e-6:
-            adjustable = [c for c in channels if min_amount < proposed[c] < max_amount]
-            if not adjustable:
-                adjustable = channels
-            per_channel_delta = remaining_budget / len(adjustable)
-            for channel in adjustable:
-                proposed[channel] = min(max(proposed[channel] + per_channel_delta, min_amount), max_amount)
+        lower_bound = monthly_budget * lower_share
+        upper_bound = monthly_budget * upper_share
+        bounds = [(lower_bound, upper_bound) for _ in channels]
 
         current = self._current_monthly_allocation(session_id, channels)
-        incremental_revenue = {
-            channel: round(proposed[channel] * artifacts.roas[channel], 2) for channel in channels
-        }
-        charts = [self._build_budget_chart(current, proposed), self._build_forecast_chart(current, proposed, artifacts.roas)]
-        table = [
-            {
-                "channel": channel,
-                "current_budget": round(current[channel], 2),
-                "recommended_budget": round(proposed[channel], 2),
-                "estimated_revenue": incremental_revenue[channel],
-            }
-            for channel in channels
+        start = np.array([current[channel] for channel in channels], dtype=float)
+        if start.sum() <= 0:
+            start = np.full(len(channels), monthly_budget / max(len(channels), 1), dtype=float)
+        start = self._project_allocation_to_bounds(start, monthly_budget, lower_bound, upper_bound)
+
+        def objective(values: np.ndarray) -> float:
+            allocation = {channel: float(value) for channel, value in zip(channels, values)}
+            return -self._predict_monthly_revenue(artifacts, allocation)
+
+        result = minimize(
+            objective,
+            x0=start,
+            method="SLSQP",
+            bounds=bounds,
+            constraints=[{"type": "eq", "fun": lambda x: np.sum(x) - monthly_budget}],
+        )
+
+        if result.success:
+            proposed_values = self._project_allocation_to_bounds(result.x, monthly_budget, lower_bound, upper_bound)
+        else:
+            weights = np.array(
+                [max(self._marginal_roi_for_budget(artifacts, channel, current[channel]), 1e-6) for channel in channels],
+                dtype=float,
+            )
+            weights = weights / max(weights.sum(), 1e-9)
+            proposed_values = self._project_allocation_to_bounds(
+                weights * monthly_budget,
+                monthly_budget,
+                lower_bound,
+                upper_bound,
+            )
+
+        proposed = {channel: float(value) for channel, value in zip(channels, proposed_values)}
+        current_forecast, current_lower, current_upper = self._forecast_interval(artifacts, current)
+        proposed_forecast, proposed_lower, proposed_upper = self._forecast_interval(artifacts, proposed)
+
+        table = []
+        for channel in channels:
+            channel_revenue = self._channel_monthly_revenue(artifacts, channel, proposed[channel])
+            table.append(
+                {
+                    "channel": channel,
+                    "current_budget": round(current[channel], 2),
+                    "recommended_budget": round(proposed[channel], 2),
+                    "estimated_revenue": round(channel_revenue, 2),
+                    "marginal_roi": round(self._marginal_roi_for_budget(artifacts, channel, proposed[channel]), 4),
+                }
+            )
+
+        charts = [
+            self._build_budget_chart(current, proposed),
+            self._build_forecast_chart(
+                {
+                    "Current": (current_forecast, current_lower, current_upper),
+                    "Recommended": (proposed_forecast, proposed_lower, proposed_upper),
+                }
+            ),
         ]
         return ToolResult(
             tool="optimize_budget",
             title="Optimized budget allocation",
-            summary="The allocation leans into higher modeled ROAS while respecting simple minimum and maximum share constraints.",
+            summary="Budget was optimized with constrained nonlinear response curves rather than proportional ROAS weighting, so diminishing returns are respected channel by channel.",
             metrics={
                 "monthly_budget": round(monthly_budget, 2),
-                "projected_revenue": round(sum(incremental_revenue.values()), 2),
+                "projected_revenue": round(proposed_forecast, 2),
+                "optimizer_success": str(bool(result.success)),
             },
             tables={"budget_recommendation": table},
             charts=charts,
@@ -254,10 +384,10 @@ class MMMEngine:
         channel_multipliers: dict[str, float],
     ) -> ToolResult:
         artifacts = self._ensure_model(session_id)
-        base_budget = self._current_monthly_allocation(session_id, list(artifacts.roas.keys()))
+        base_budget = self._current_monthly_allocation(session_id, artifacts.feature_columns)
         scenario_budget = {
             channel: round(base_budget[channel] * channel_multipliers.get(channel, 1.0), 2)
-            for channel in artifacts.roas
+            for channel in artifacts.feature_columns
         }
         return self.compare_scenarios(
             session_id,
@@ -270,58 +400,432 @@ class MMMEngine:
     def compare_scenarios(self, session_id: str, scenarios: dict[str, dict[str, float]]) -> ToolResult:
         artifacts = self._ensure_model(session_id)
         scenario_table: list[dict[str, Any]] = []
-        line_points: list[ChartDataPoint] = []
+        forecast_map: dict[str, tuple[float, float, float]] = {}
+
         for scenario_name, budget_map in scenarios.items():
-            forecast_revenue = sum(budget_map[channel] * artifacts.roas[channel] for channel in artifacts.roas)
-            lower = forecast_revenue * 0.9
-            upper = forecast_revenue * 1.1
+            normalized_budget = {
+                channel: float(budget_map.get(channel, 0.0))
+                for channel in artifacts.feature_columns
+            }
+            forecast_revenue, lower, upper = self._forecast_interval(artifacts, normalized_budget)
             row = {
                 "scenario": scenario_name,
-                "budget": round(sum(budget_map.values()), 2),
+                "budget": round(sum(normalized_budget.values()), 2),
                 "forecast_revenue": round(forecast_revenue, 2),
                 "lower_bound": round(lower, 2),
                 "upper_bound": round(upper, 2),
             }
             scenario_table.append(row)
-            line_points.append(
-                ChartDataPoint(
-                    label=scenario_name,
-                    values={
-                        "forecast_revenue": row["forecast_revenue"],
-                        "lower_bound": row["lower_bound"],
-                        "upper_bound": row["upper_bound"],
-                    },
-                )
-            )
+            forecast_map[scenario_name] = (forecast_revenue, lower, upper)
 
         return ToolResult(
             tool="compare_scenarios",
             title="Scenario comparison forecast",
-            summary="Scenario outputs are derived from the fitted ROAS profile and include a simple +/-10% confidence band for decision support.",
+            summary="Scenario forecasts use the nonlinear transformed MMM and bootstrap percentile intervals instead of fixed percentage bands.",
             tables={"scenarios": scenario_table},
+            charts=[self._build_forecast_chart(forecast_map)],
+            metrics={"best_forecast": max(row["forecast_revenue"] for row in scenario_table)},
+        )
+
+    def analyze_adstock(self, session_id: str) -> ToolResult:
+        artifacts = self._ensure_model(session_id)
+        horizon = 14
+        rows = []
+        for day in range(horizon + 1):
+            values: dict[str, float] = {}
+            for channel in artifacts.feature_columns:
+                impulse = np.zeros(horizon + 1, dtype=float)
+                impulse[0] = artifacts.channel_params[channel]["median_daily_spend"]
+                values[channel] = round(
+                    adstock_transform(impulse, artifacts.channel_params[channel]["decay_rate"])[day],
+                    4,
+                )
+            rows.append(ChartDataPoint(label=f"Day {day}", values=values))
+
+        table = []
+        for channel in artifacts.feature_columns:
+            decay = artifacts.channel_params[channel]["decay_rate"]
+            half_life = np.log(0.5) / np.log(decay) if 0.0 < decay < 1.0 else 0.0
+            table.append(
+                {
+                    "channel": channel,
+                    "decay_rate": round(decay, 4),
+                    "half_life_days": round(float(half_life), 2),
+                    "median_daily_spend": round(artifacts.channel_params[channel]["median_daily_spend"], 2),
+                }
+            )
+
+        return ToolResult(
+            tool="analyze_adstock",
+            title="Adstock carryover analysis",
+            summary="Adstock curves show how a one-day spend impulse persists over time under the modeled geometric decay.",
+            tables={"adstock_parameters": table},
             charts=[
                 ChartPayload(
-                    id="scenario-forecast",
-                    title="Scenario forecast",
-                    description="Forecasted revenue and confidence band by scenario.",
+                    id="adstock-curves",
+                    title="Adstock decay curves",
+                    description="Effective carryover from a one-day spend impulse using the channel adstock settings.",
                     type="line",
-                    data=line_points,
+                    data=rows,
                     series=[
-                        ChartSeries(key="forecast_revenue", label="Forecast Revenue", color="#60a5fa"),
-                        ChartSeries(key="lower_bound", label="Lower Bound", color="#1d4ed8"),
-                        ChartSeries(key="upper_bound", label="Upper Bound", color="#93c5fd"),
+                        ChartSeries(key=channel, label=channel, color=CHANNEL_COLORS.get(channel, "#94a3b8"))
+                        for channel in artifacts.feature_columns
                     ],
                     x_key="label",
-                    y_key="forecast_revenue",
+                    y_key=artifacts.feature_columns[0] if artifacts.feature_columns else None,
                 )
             ],
-            metrics={"best_forecast": max(row["forecast_revenue"] for row in scenario_table)},
+        )
+
+    def analyze_saturation(self, session_id: str) -> ToolResult:
+        artifacts = self._ensure_model(session_id)
+        rows = []
+        spend_grid = np.linspace(0.0, 2.0, 11)
+        for multiplier in spend_grid:
+            values: dict[str, float] = {}
+            label = f"{multiplier:.1f}x"
+            for channel in artifacts.feature_columns:
+                baseline = max(artifacts.current_monthly_allocation[channel], 1e-6)
+                values[channel] = round(
+                    self._channel_monthly_revenue(artifacts, channel, baseline * multiplier),
+                    4,
+                )
+            rows.append(ChartDataPoint(label=label, values=values))
+
+        table = []
+        for channel in artifacts.feature_columns:
+            params = artifacts.channel_params[channel]
+            table.append(
+                {
+                    "channel": channel,
+                    "half_saturation": round(params["half_saturation"], 4),
+                    "hill_slope": round(params["slope"], 4),
+                    "current_monthly_spend": round(artifacts.current_monthly_allocation[channel], 2),
+                }
+            )
+
+        return ToolResult(
+            tool="analyze_saturation",
+            title="Saturation curve analysis",
+            summary="Saturation curves map higher spend into smaller incremental response as each channel approaches its modeled saturation point.",
+            tables={"saturation_parameters": table},
+            charts=[
+                ChartPayload(
+                    id="saturation-curves",
+                    title="Monthly spend response curves",
+                    description="Modeled monthly revenue contribution as spend scales from zero to 2x the current monthly baseline.",
+                    type="line",
+                    data=rows,
+                    series=[
+                        ChartSeries(key=channel, label=channel, color=CHANNEL_COLORS.get(channel, "#94a3b8"))
+                        for channel in artifacts.feature_columns
+                    ],
+                    x_key="label",
+                    y_key=artifacts.feature_columns[0] if artifacts.feature_columns else None,
+                )
+            ],
+        )
+
+    def get_marginal_roi(self, session_id: str) -> ToolResult:
+        artifacts = self._ensure_model(session_id)
+        rows = []
+        marginal_roi: dict[str, float] = {}
+        for channel in artifacts.feature_columns:
+            current_spend = artifacts.current_monthly_allocation[channel]
+            value = self._marginal_roi_for_budget(artifacts, channel, current_spend)
+            marginal_roi[channel] = value
+            rows.append(
+                {
+                    "channel": channel,
+                    "current_monthly_spend": round(current_spend, 2),
+                    "marginal_roi": round(value, 4),
+                    "average_roas": round(artifacts.roas[channel], 4),
+                }
+            )
+        return ToolResult(
+            tool="get_marginal_roi",
+            title="Marginal ROI by channel",
+            summary="Marginal ROI estimates the next dollar's modeled return for each channel after adstock and saturation effects.",
+            tables={"marginal_roi": rows},
+            charts=[
+                ChartPayload(
+                    id="marginal-roi",
+                    title="Marginal ROI",
+                    description="Incremental modeled return on the next dollar at current spend levels.",
+                    type="bar",
+                    data=[
+                        ChartDataPoint(
+                            label=channel,
+                            value=round(value, 4),
+                            color=CHANNEL_COLORS.get(channel, "#94a3b8"),
+                        )
+                        for channel, value in sorted(marginal_roi.items(), key=lambda item: item[1], reverse=True)
+                    ],
+                    series=[ChartSeries(key="value", label="Marginal ROI", color="#60a5fa")],
+                    x_key="value",
+                    y_key="label",
+                )
+            ],
+        )
+
+    def channel_deep_dive(self, session_id: str, channel: str) -> ToolResult:
+        artifacts = self._ensure_model(session_id)
+        resolved = self._resolve_channel_name(channel, artifacts.feature_columns)
+        if resolved is None:
+            raise ValueError(f"Channel '{channel}' was not found in the dataset.")
+
+        params = artifacts.channel_params[resolved]
+        weekly_breakdown = pd.DataFrame(
+            {
+                "week": [idx.strftime("%Y-%m-%d") for idx in artifacts.weekly_spend.index],
+                "spend": artifacts.weekly_spend[resolved].round(2).tolist(),
+                "adstock": artifacts.daily_adstock[resolved].resample("W-SUN").mean().round(4).tolist(),
+                "saturation": artifacts.weekly_features[resolved].round(4).tolist(),
+                "contribution": artifacts.weekly_contribution[resolved].round(4).tolist(),
+            }
+        ).tail(12)
+
+        summary_row = [
+            {
+                "channel": resolved,
+                "total_spend": round(artifacts.spend_by_channel[resolved], 2),
+                "roas": round(artifacts.roas[resolved], 4),
+                "contribution_share": round(artifacts.contributions[resolved] * 100.0, 2),
+                "marginal_roi": round(
+                    self._marginal_roi_for_budget(artifacts, resolved, artifacts.current_monthly_allocation[resolved]),
+                    4,
+                ),
+                "decay_rate": round(params["decay_rate"], 4),
+                "half_saturation": round(params["half_saturation"], 4),
+                "hill_slope": round(params["slope"], 4),
+            }
+        ]
+
+        recent_rows = [
+            ChartDataPoint(
+                label=row["week"],
+                values={
+                    "spend": float(row["spend"]),
+                    "adstock": float(row["adstock"]),
+                    "saturation": float(row["saturation"]),
+                    "contribution": float(row["contribution"]),
+                },
+                color=CHANNEL_COLORS.get(resolved, "#94a3b8"),
+            )
+            for row in weekly_breakdown.to_dict(orient="records")
+        ]
+
+        return ToolResult(
+            tool="channel_deep_dive",
+            title=f"{resolved} channel deep dive",
+            summary="This view combines spend trend, carryover, saturation, and modeled contribution for a single channel.",
+            tables={
+                "channel_summary": summary_row,
+                "weekly_breakdown": weekly_breakdown.to_dict(orient="records"),
+            },
+            charts=[
+                ChartPayload(
+                    id=f"{resolved.lower()}-trend",
+                    title=f"{resolved} spend and adstock",
+                    description="Weekly spend against average weekly adstocked pressure.",
+                    type="line",
+                    data=recent_rows,
+                    series=[
+                        ChartSeries(key="spend", label="Spend", color="#38bdf8"),
+                        ChartSeries(key="adstock", label="Adstock", color="#f59e0b"),
+                    ],
+                    x_key="label",
+                    y_key="spend",
+                ),
+                ChartPayload(
+                    id=f"{resolved.lower()}-response",
+                    title=f"{resolved} saturation and contribution",
+                    description="Weekly transformed feature value and modeled contribution over time.",
+                    type="line",
+                    data=recent_rows,
+                    series=[
+                        ChartSeries(key="saturation", label="Saturation", color="#22c55e"),
+                        ChartSeries(key="contribution", label="Contribution", color="#6366f1"),
+                    ],
+                    x_key="label",
+                    y_key="contribution",
+                ),
+            ],
         )
 
     def _ensure_model(self, session_id: str) -> MMMArtifacts:
         if session_id not in self.models:
             self.fit_model(session_id)
         return self.models[session_id]
+
+    def _prepare_model_inputs(self, df: pd.DataFrame) -> dict[str, Any]:
+        channels = sorted(df["channel"].astype(str).unique().tolist())
+        full_index = pd.date_range(df["date"].min(), df["date"].max(), freq="D")
+
+        daily_spend = (
+            df.pivot_table(index="date", columns="channel", values="spend", aggfunc="sum", fill_value=0.0)
+            .reindex(full_index, fill_value=0.0)
+            .sort_index()
+        )
+        daily_spend.index.name = "date"
+        daily_spend = daily_spend.reindex(columns=channels, fill_value=0.0)
+
+        daily_revenue = (
+            df.groupby("date")["revenue"]
+            .sum()
+            .reindex(full_index, fill_value=0.0)
+            .sort_index()
+        )
+        daily_revenue.index.name = "date"
+
+        daily_adstock = pd.DataFrame(index=full_index)
+        daily_saturation = pd.DataFrame(index=full_index)
+        channel_params: dict[str, dict[str, float]] = {}
+        for channel in channels:
+            spend_values = daily_spend[channel].to_numpy(dtype=float)
+            median_spend = float(np.median(spend_values[spend_values > 0])) if np.any(spend_values > 0) else 1.0
+            channel_params[channel] = {
+                "decay_rate": DEFAULT_ADSTOCK_DECAY,
+                "half_saturation": max(median_spend, 1e-6),
+                "slope": DEFAULT_HILL_SLOPE,
+                "median_daily_spend": max(median_spend, 1e-6),
+            }
+            adstocked = adstock_transform(spend_values, DEFAULT_ADSTOCK_DECAY)
+            saturated = hill_saturation(adstocked, median_spend, DEFAULT_HILL_SLOPE)
+            daily_adstock[channel] = adstocked
+            daily_saturation[channel] = saturated
+
+        weekly_features = daily_saturation.resample("W-SUN").sum()
+        weekly_target = daily_revenue.resample("W-SUN").sum().reindex(weekly_features.index, fill_value=0.0)
+        weekly_spend = daily_spend.resample("W-SUN").sum().reindex(weekly_features.index, fill_value=0.0)
+
+        return {
+            "daily_spend": daily_spend,
+            "daily_adstock": daily_adstock,
+            "daily_saturation": daily_saturation,
+            "weekly_features": weekly_features,
+            "weekly_target": weekly_target,
+            "weekly_spend": weekly_spend,
+            "channel_params": channel_params,
+        }
+
+    def _bootstrap_model(
+        self,
+        weekly_features: pd.DataFrame,
+        weekly_target: pd.Series,
+        fitted: np.ndarray,
+        residuals: np.ndarray,
+        feature_columns: list[str],
+        spend_by_channel: dict[str, float],
+    ) -> dict[str, Any]:
+        rng = np.random.default_rng(42)
+        coefficient_samples = np.zeros((BOOTSTRAP_SAMPLES, len(feature_columns)), dtype=float)
+        intercept_samples = np.zeros(BOOTSTRAP_SAMPLES, dtype=float)
+        prediction_samples = np.zeros((BOOTSTRAP_SAMPLES, len(weekly_target)), dtype=float)
+        roas_samples = {channel: np.zeros(BOOTSTRAP_SAMPLES, dtype=float) for channel in feature_columns}
+        contribution_samples = {channel: np.zeros(BOOTSTRAP_SAMPLES, dtype=float) for channel in feature_columns}
+
+        x = weekly_features
+        fitted_array = np.asarray(fitted, dtype=float)
+        residual_array = np.asarray(residuals, dtype=float)
+        for idx in range(BOOTSTRAP_SAMPLES):
+            sampled_residuals = rng.choice(residual_array, size=len(residual_array), replace=True)
+            y_boot = fitted_array + sampled_residuals
+            boot_model = Ridge(alpha=1.0)
+            boot_model.fit(x, y_boot)
+            boot_predictions = boot_model.predict(x)
+            prediction_samples[idx] = boot_predictions
+            intercept_samples[idx] = float(boot_model.intercept_)
+            coefficient_samples[idx] = boot_model.coef_
+
+            raw_contributions = {
+                channel: float(x[channel].sum() * coef)
+                for channel, coef in zip(feature_columns, boot_model.coef_)
+            }
+            positive_total = sum(max(value, 0.0) for value in raw_contributions.values()) or 1.0
+            for channel in feature_columns:
+                roas_samples[channel][idx] = max(raw_contributions.get(channel, 0.0), 0.0) / max(
+                    spend_by_channel.get(channel, 1.0),
+                    1.0,
+                )
+                contribution_samples[channel][idx] = max(raw_contributions.get(channel, 0.0), 0.0) / positive_total
+
+        return {
+            "coefficients": coefficient_samples,
+            "intercepts": intercept_samples,
+            "predictions": prediction_samples,
+            "roas": roas_samples,
+            "contributions": contribution_samples,
+        }
+
+    def _build_weekly_summary(
+        self,
+        weekly_index: pd.Index,
+        actual: np.ndarray,
+        predicted: np.ndarray,
+        bootstrap_predictions: np.ndarray,
+    ) -> list[dict[str, Any]]:
+        lower = np.percentile(bootstrap_predictions, 5, axis=0)
+        upper = np.percentile(bootstrap_predictions, 95, axis=0)
+        rows = []
+        for idx, date_value in enumerate(weekly_index):
+            rows.append(
+                {
+                    "week": pd.Timestamp(date_value).strftime("%Y-%m-%d"),
+                    "actual_revenue": round(float(actual[idx]), 2),
+                    "predicted_revenue": round(float(predicted[idx]), 2),
+                    "lower_bound": round(float(lower[idx]), 2),
+                    "upper_bound": round(float(upper[idx]), 2),
+                }
+            )
+        return rows
+
+    def _predict_monthly_revenue(self, artifacts: MMMArtifacts, allocation: dict[str, float]) -> float:
+        feature_vector = np.array(
+            [self._steady_state_weekly_feature(artifacts, channel, allocation.get(channel, 0.0)) for channel in artifacts.feature_columns],
+            dtype=float,
+        )
+        coefficients = np.array([artifacts.coefficients[channel] for channel in artifacts.feature_columns], dtype=float)
+        return float(artifacts.intercept * WEEKS_PER_MONTH + np.dot(feature_vector, coefficients))
+
+    def _forecast_interval(self, artifacts: MMMArtifacts, allocation: dict[str, float]) -> tuple[float, float, float]:
+        mean_forecast = self._predict_monthly_revenue(artifacts, allocation)
+        feature_vector = np.array(
+            [
+                self._steady_state_weekly_feature(artifacts, channel, allocation.get(channel, 0.0))
+                for channel in artifacts.feature_columns
+            ],
+            dtype=float,
+        )
+        bootstrap_forecasts = []
+        for intercept, coefficients in zip(artifacts.bootstrap_intercepts, artifacts.bootstrap_coefficients):
+            bootstrap_forecasts.append(float(intercept * WEEKS_PER_MONTH + np.dot(feature_vector, coefficients)))
+        lower, upper = self._percentile_interval(np.array(bootstrap_forecasts, dtype=float))
+        return mean_forecast, lower, upper
+
+    def _steady_state_weekly_feature(self, artifacts: MMMArtifacts, channel: str, monthly_budget: float) -> float:
+        params = artifacts.channel_params[channel]
+        daily_spend = max(float(monthly_budget), 0.0) / DAYS_PER_MONTH
+        steady_adstock = daily_spend / max(1.0 - params["decay_rate"], 1e-6)
+        saturated = hill_saturation(np.array([steady_adstock]), params["half_saturation"], params["slope"])[0]
+        return float(saturated * 7.0)
+
+    def _channel_monthly_revenue(self, artifacts: MMMArtifacts, channel: str, monthly_budget: float) -> float:
+        coefficient = artifacts.coefficients.get(channel, 0.0)
+        return float(coefficient * self._steady_state_weekly_feature(artifacts, channel, monthly_budget) * WEEKS_PER_MONTH)
+
+    def _marginal_roi_for_budget(self, artifacts: MMMArtifacts, channel: str, monthly_budget: float) -> float:
+        params = artifacts.channel_params[channel]
+        coefficient = artifacts.coefficients.get(channel, 0.0)
+        daily_spend = max(float(monthly_budget), 0.0) / DAYS_PER_MONTH
+        steady_adstock = daily_spend / max(1.0 - params["decay_rate"], 1e-6)
+        saturation_slope = hill_derivative(np.array([steady_adstock]), params["half_saturation"], params["slope"])[0]
+        d_adstock_d_budget = 1.0 / (DAYS_PER_MONTH * max(1.0 - params["decay_rate"], 1e-6))
+        return float(WEEKS_PER_MONTH * coefficient * 7.0 * saturation_slope * d_adstock_d_budget)
+
+    def _resolve_channel_name(self, channel: str, channels: list[str]) -> str | None:
+        channel_map = {value.lower(): value for value in channels}
+        return channel_map.get(channel.lower())
 
     def _normalize_columns(self, frame: pd.DataFrame, mapping: ColumnMapping) -> pd.DataFrame:
         missing = [value for value in mapping.model_dump().values() if value not in frame.columns]
@@ -342,15 +846,22 @@ class MMMEngine:
         if frame[["date", "channel", "spend", "revenue"]].isnull().any().any():
             raise ValueError("CSV contains null values in required columns.")
 
-    def _build_roas_chart(self, roas: dict[str, float]) -> ChartPayload:
-        rows = [
-            ChartDataPoint(label=channel, value=round(value, 4), color=CHANNEL_COLORS.get(channel, "#94a3b8"))
-            for channel, value in sorted(roas.items(), key=lambda item: item[1], reverse=True)
-        ]
+    def _build_roas_chart(self, roas: dict[str, float], bootstrap_roas: dict[str, np.ndarray]) -> ChartPayload:
+        rows = []
+        for channel, value in sorted(roas.items(), key=lambda item: item[1], reverse=True):
+            lower, upper = self._percentile_interval(bootstrap_roas[channel])
+            rows.append(
+                ChartDataPoint(
+                    label=channel,
+                    value=round(value, 4),
+                    color=CHANNEL_COLORS.get(channel, "#94a3b8"),
+                    meta={"lower_bound": round(lower, 4), "upper_bound": round(upper, 4)},
+                )
+            )
         return ChartPayload(
             id="roas-chart",
             title="ROAS by channel",
-            description="Modeled return on ad spend for each channel.",
+            description="Modeled return on ad spend by channel with bootstrap confidence intervals.",
             type="bar",
             data=rows,
             series=[ChartSeries(key="value", label="ROAS", color="#60a5fa")],
@@ -358,15 +869,25 @@ class MMMEngine:
             y_key="label",
         )
 
-    def _build_contribution_chart(self, contributions: dict[str, float], df: pd.DataFrame) -> ChartPayload:
+    def _build_contribution_chart(
+        self,
+        contributions: dict[str, float],
+        bootstrap_contributions: dict[str, np.ndarray],
+        df: pd.DataFrame,
+    ) -> ChartPayload:
         rows = []
         for channel, share in sorted(contributions.items(), key=lambda item: item[1], reverse=True):
+            lower, upper = self._percentile_interval(bootstrap_contributions[channel] * 100.0)
             rows.append(
                 ChartDataPoint(
                     label=channel,
-                    value=round(share * 100, 2),
+                    value=round(share * 100.0, 2),
                     color=CHANNEL_COLORS.get(channel, "#94a3b8"),
-                    meta={"spend": round(float(df[df["channel"] == channel]["spend"].sum()), 2)},
+                    meta={
+                        "spend": round(float(df[df["channel"] == channel]["spend"].sum()), 2),
+                        "lower_bound": round(lower, 2),
+                        "upper_bound": round(upper, 2),
+                    },
                 )
             )
         return ChartPayload(
@@ -393,7 +914,7 @@ class MMMEngine:
         return ChartPayload(
             id="efficiency-scatter",
             title="Spend vs revenue",
-            description="Channel efficiency across total spend and observed revenue.",
+            description="Channel efficiency across observed spend and revenue.",
             type="scatter",
             data=rows,
             series=[
@@ -427,33 +948,22 @@ class MMMEngine:
             y_key="recommended",
         )
 
-    def _build_forecast_chart(
-        self,
-        current: dict[str, float],
-        proposed: dict[str, float],
-        roas: dict[str, float],
-    ) -> ChartPayload:
-        scenarios = {
-            "Current": current,
-            "Recommended": proposed,
-        }
-        rows = []
-        for name, allocation in scenarios.items():
-            forecast = sum(allocation[channel] * roas[channel] for channel in allocation)
-            rows.append(
-                ChartDataPoint(
-                    label=name,
-                    values={
-                        "forecast_revenue": round(forecast, 2),
-                        "lower_bound": round(forecast * 0.9, 2),
-                        "upper_bound": round(forecast * 1.1, 2),
-                    },
-                )
+    def _build_forecast_chart(self, scenarios: dict[str, tuple[float, float, float]]) -> ChartPayload:
+        rows = [
+            ChartDataPoint(
+                label=name,
+                values={
+                    "forecast_revenue": round(values[0], 2),
+                    "lower_bound": round(values[1], 2),
+                    "upper_bound": round(values[2], 2),
+                },
             )
+            for name, values in scenarios.items()
+        ]
         return ChartPayload(
             id="forecast-compare",
             title="Forecast comparison",
-            description="Projected revenue for current and recommended budget plans.",
+            description="Projected revenue by scenario with bootstrap percentile intervals.",
             type="line",
             data=rows,
             series=[
@@ -465,6 +975,34 @@ class MMMEngine:
             y_key="forecast_revenue",
         )
 
+    def _build_weekly_fit_chart(self, weekly_summary: list[dict[str, Any]]) -> ChartPayload:
+        return ChartPayload(
+            id="weekly-fit",
+            title="Weekly actual vs predicted revenue",
+            description="Observed weekly revenue, model fit, and bootstrap interval over the modeled period.",
+            type="line",
+            data=[
+                ChartDataPoint(
+                    label=row["week"],
+                    values={
+                        "actual_revenue": float(row["actual_revenue"]),
+                        "predicted_revenue": float(row["predicted_revenue"]),
+                        "lower_bound": float(row["lower_bound"]),
+                        "upper_bound": float(row["upper_bound"]),
+                    },
+                )
+                for row in weekly_summary
+            ],
+            series=[
+                ChartSeries(key="actual_revenue", label="Actual Revenue", color="#0f172a"),
+                ChartSeries(key="predicted_revenue", label="Predicted Revenue", color="#60a5fa"),
+                ChartSeries(key="lower_bound", label="Lower Bound", color="#93c5fd"),
+                ChartSeries(key="upper_bound", label="Upper Bound", color="#dbeafe"),
+            ],
+            x_key="label",
+            y_key="predicted_revenue",
+        )
+
     def _current_monthly_allocation(self, session_id: str, channels: list[str]) -> dict[str, float]:
         df = self.get_dataframe(session_id)
         total_months = max(df["date"].dt.to_period("M").nunique(), 1)
@@ -473,3 +1011,44 @@ class MMMEngine:
             channel: round(float(current.get(channel, 0.0) / total_months), 2)
             for channel in channels
         }
+
+    def _channel_parameter_rows(self, channel_params: dict[str, dict[str, float]]) -> list[dict[str, Any]]:
+        rows = []
+        for channel, params in channel_params.items():
+            rows.append(
+                {
+                    "channel": channel,
+                    "adstock_decay": round(params["decay_rate"], 4),
+                    "half_saturation": round(params["half_saturation"], 4),
+                    "hill_slope": round(params["slope"], 4),
+                }
+            )
+        return rows
+
+    def _percentile_interval(self, values: np.ndarray) -> tuple[float, float]:
+        array = np.asarray(values, dtype=float)
+        return float(np.percentile(array, 5)), float(np.percentile(array, 95))
+
+    def _project_allocation_to_bounds(
+        self,
+        values: np.ndarray,
+        total_budget: float,
+        lower_bound: float,
+        upper_bound: float,
+    ) -> np.ndarray:
+        projected = np.clip(np.asarray(values, dtype=float), lower_bound, upper_bound)
+        for _ in range(20):
+            delta = float(total_budget - projected.sum())
+            if abs(delta) <= 1e-6:
+                break
+            if delta > 0:
+                room = upper_bound - projected
+            else:
+                room = projected - lower_bound
+            adjustable = room > 1e-9
+            if not np.any(adjustable):
+                break
+            weights = room[adjustable] / max(room[adjustable].sum(), 1e-9)
+            projected[adjustable] += np.sign(delta) * min(abs(delta), room[adjustable].sum()) * weights
+            projected = np.clip(projected, lower_bound, upper_bound)
+        return projected
